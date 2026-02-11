@@ -43,7 +43,7 @@ The VAG rain/light sensor uses the **LIN (Local Interconnect Network)** protocol
 | Baud Rate      | 19200 baud                                               |
 | UART Config    | 8 data bits, No parity, 1 Stop bit (8N1)                |
 | Break Field    | ≥ 13 bit times dominant (low) — generated via PIO        |
-| Checksum        | Classic Checksum (inverted modulo-256 sum of **data bytes only**, excludes PID) |
+| Checksum        | Classic (LIN 1.x) or Enhanced (LIN 2.x) |
 | Sync Byte      | `0x55`                                                   |
 
 ### LIN Frame Structure
@@ -56,7 +56,7 @@ The RP2040 (master) sends the **header** (Break + Sync + PID). For slave-respons
 
 ## Hardware Architecture
 
-The transceiver uses a **single NPN transistor** design for TX, with logic inversion handled in hardware via the RP2040's `GPIO_CTRL.OUTOVER` register or in PIO software. This is simpler and equally effective compared to a dual-transistor non-inverting design, thanks to the RP2040's PIO flexibility.
+The transceiver uses a **single NPN transistor** design for TX, with logic inversion handled in hardware via the RP2040's PIO software logic.
 
 See [WIRING.md](WIRING.md) for the full circuit description, schematic, and component values.
 
@@ -65,9 +65,9 @@ See [WIRING.md](WIRING.md) for the full circuit description, schematic, and comp
 | RP2040 Pin | Function | Direction | Description                     |
 |------------|----------|-----------|---------------------------------|
 | GPIO0      | LIN TX   | Output    | To NPN base via 1kΩ resistor   |
-| GPIO0      | LIN RX   | Input     | From voltage divider (shared bus, directly from LIN bus via divider) |
+| GPIO1      | LIN RX   | Input     | From voltage divider (shared bus, directly from LIN bus via divider) |
 
-> **Note:** TX and RX may use separate GPIOs depending on PIO program design. GPIO0 is the primary LIN bus GPIO.
+> **Note:** TX and RX use separate GPIOs. GPIO0 is the primary LIN bus TX GPIO.
 
 ### Signal Inversion (TX)
 
@@ -78,7 +78,7 @@ The single NPN common-emitter topology **inverts** the logic:
 | LOW (0V)    | OFF        | Pulled to 12V    | Recessive (Idle) |
 | HIGH (3.3V) | ON         | Pulled to GND    | Dominant   |
 
-This inversion is compensated by setting `IO_BANK0_GPIO0_CTRL.OUTOVER = 0x1` (invert peripheral output) so the PIO state machine can use standard UART logic (Idle = High).
+This inversion is compensated by the PIO state machine program, which drives the pin with inverted logic compared to standard UART.
 
 ## Bill of Materials (BOM)
 
@@ -95,6 +95,26 @@ This inversion is compensated by setting `IO_BANK0_GPIO0_CTRL.OUTOVER = 0x1` (in
 
 > \* RX divider values of **33kΩ / 10kΩ** give ~3.3V at 14.4V input. Alternative safe combinations: **42kΩ / 12kΩ** (~3.2V @ 14.4V) or **45kΩ / 12kΩ** (~3.03V @ 14.4V). If using a lower ratio like 30kΩ / 12kΩ, a 3.3V Zener clamp is **mandatory**.
 
+## How to use
+
+### Scanner
+
+To find the LIN ID of your sensor, run the scanner script:
+
+1.  Connect the hardware as described in [WIRING.md](WIRING.md).
+2.  Upload `scanner.py` to your RP2040.
+3.  Run the script.
+4.  It will cycle through all possible LIN IDs (0x00 - 0x3F).
+5.  Watch the console for `[FOUND]` messages.
+
+### Main Program
+
+The `main.py` script contains the logic to communicate with the sensor. It is configured to poll the IDs found by the scanner.
+
+1.  Configure the `target_ids` list in `main.py` with the IDs found by the scanner.
+2.  Run `main.py`.
+3.  The script will poll the sensor and decode the response.
+
 ## Software Implementation Notes
 
 ### PIO-Based LIN
@@ -103,14 +123,13 @@ The RP2040's PIO is used for LIN communication because:
 
 1. **Break field generation** — standard UARTs cannot easily produce a 13+ bit dominant state. PIO can hold the pin low for the exact number of cycles required.
 2. **Precise timing** — PIO runs independently of the CPU, ensuring accurate baud rate timing.
-3. **Hardware inversion** — `GPIO_CTRL.OUTOVER` allows transparent signal inversion at the pad level.
+3. **Logic inversion** — The PIO program handles the logical inversion required by the NPN driver.
 
 ### Break Field Generation Alternatives
 
 | Method                     | Description                                         |
 |----------------------------|-----------------------------------------------------|
 | **PIO (Recommended)**      | State machine pulls pin low for ≥13 bit periods, then shifts out Sync/ID |
-| Baud Rate Switch           | Set baud to 9600, send `0x00` (generates a long low), switch back to 19200 |
 
 ## Power Requirements
 
