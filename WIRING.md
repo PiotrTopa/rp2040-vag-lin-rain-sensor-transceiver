@@ -1,6 +1,6 @@
 # Wiring Guide — RP2040 LIN Transceiver
 
-Complete circuit description for interfacing the RP2040 (3.3V) with the VW Rain/Light Sensor G397 (12V LIN bus) using discrete components.
+Complete circuit description for interfacing the RP2040 (3.3V) with the VAG Rain/Light/Humidity Sensor 81A 955 555 A (12V LIN bus) using discrete components.
 
 ## Block Diagram
 

@@ -1,307 +1,226 @@
-import rp2
-from machine import Pin, UART
+"""
+VAG Rain/Light/Humidity Sensor — BCM Emulator
+
+81A 955 555 A (MQB RLS — G397_RLFSS)
+
+LIN master schedule loop that keeps the sensor fully active.
+Decodes: forward light (16-bit), temperature, humidity/dew point,
+rain intensity. DRL switching logic included.
+
+Hardware: RP2040 + NPN transistor LIN transceiver
+  TX = GPIO0, RX = GPIO1, 19200 baud
+
+Usage (REPL):
+    from main import *
+    run()                    # BCM emulation
+    run(wiper=0)             # Wiper off
+    run(sensitivity=4)       # Rain sensitivity 0-7
+    run(verbose=True)        # Show raw frames
+"""
+
+from lin import LIN
 import time
 
-# ==========================================
-# 1. LOWER LAYER: LIN DRIVER (PIO + UART)
-# ==========================================
-# This section handles the physical layer signal generation.
-# It is specific to the RP2040 implementation.
 
-@rp2.asm_pio(out_init=rp2.PIO.OUT_LOW, set_init=rp2.PIO.OUT_LOW, out_shiftdir=rp2.PIO.SHIFT_RIGHT)
-def lin_header_tx():
-    # Wait for trigger — PIO stalls here, pin LOW → Q1 OFF → bus recessive (12V)
-    pull(block)                        # Get pre-inverted PID value from Python
-    mov(y, osr)                        # Save inverted PID in Y register for later
-    
-    # --- Step 1: Break Field (13+ bits: pin HIGH → Q1 ON → bus dominant 0V) ---
-    set(pins, 1)              [7]      # Drive HIGH (dominant) — 8 cycles
-    set(x, 5)                 [7]      # Loop counter — pin latched HIGH — 8 cycles
-    label("break_loop")
-    nop()                     [7]      # 8 cycles
-    jmp(x_dec, "break_loop")  [7]      # 8 cycles → 6 iterations × 16 = 96 + 16 = 112 → total 14 bit times
-    
-    # --- Step 2: Break Delimiter (1 bit: pin LOW → Q1 OFF → bus recessive 12V) ---
-    set(pins, 0)              [7]      # Drive LOW (recessive) — 8 cycles = 1 bit time
-    
-    # --- Step 3: Send Sync Byte (0x55) — inverted pin levels for NPN ---
-    # 0x55 = 01010101, LSB first: 1, 0, 1, 0, 1, 0, 1, 0
-    # Inverted on pin:           0, 1, 0, 1, 0, 1, 0, 1
-    # Start bit (pin HIGH → bus dominant)
-    set(pins, 1)              [7]
-    # Data bits (inverted: data 1 → pin LOW, data 0 → pin HIGH)
-    set(pins, 0)              [7]      # Bit 0 (data=1 → pin LOW)
-    set(pins, 1)              [7]      # Bit 1 (data=0 → pin HIGH)
-    set(pins, 0)              [7]      # Bit 2 (data=1 → pin LOW)
-    set(pins, 1)              [7]      # Bit 3 (data=0 → pin HIGH)
-    set(pins, 0)              [7]      # Bit 4 (data=1 → pin LOW)
-    set(pins, 1)              [7]      # Bit 5 (data=0 → pin HIGH)
-    set(pins, 0)              [7]      # Bit 6 (data=1 → pin LOW)
-    set(pins, 1)              [7]      # Bit 7 (data=0 → pin HIGH)
-    # Stop bit (pin LOW → bus recessive)
-    set(pins, 0)              [7]
-    
-    # --- Step 4: Send PID (from Y register, pre-inverted by Python) ---
-    # Inter-byte space (bus recessive from stop bit, pin stays LOW)
-    mov(osr, y)               [7]      # Restore inverted PID to OSR — 8 cycles LOW (recessive)
-    # Start bit (pin HIGH → bus dominant)
-    set(pins, 1)              [6]      # 7 cycles HIGH
-    set(x, 7)                          # 1 cycle HIGH — total start bit = 8 cycles
-    # Data bits — out drives the pin with pre-inverted data
-    label("pid_loop")
-    out(pins, 1)              [6]      # Shift 1 bit out (LSB first) — 7 cycles
-    jmp(x_dec, "pid_loop")             # 1 cycle (pin latched) — total per bit = 8 cycles
-    # Stop bit (pin LOW → bus recessive)
-    set(pins, 0)              [7]      # 8 cycles LOW
-    
-    # Wrap back to pull(block) — PIO stalls, pin LOW → Q1 OFF → bus recessive (12V)
+# ================================================================
+# Configuration
+# ================================================================
 
-class LINMaster:
-    def __init__(self, tx_pin_num=0, rx_pin_num=1, baud=19200):
-        self.baud = baud
-        self.tx_pin_num = tx_pin_num
-        self.rx_pin_num = rx_pin_num
-        
-        # 1. Setup UART for RX 
-        self.uart = UART(0, baudrate=self.baud, tx=Pin(12), rx=Pin(rx_pin_num), bits=8, parity=None, stop=1)
-        
-        # 2. Setup PIO for TX
-        sm_freq = self.baud * 8
-        self.sm = rp2.StateMachine(0, lin_header_tx, freq=sm_freq, 
-                                   out_base=Pin(tx_pin_num), 
-                                   set_base=Pin(tx_pin_num))
-        self.sm.active(1)
-        print(f"LIN Master Initialized on TX={tx_pin_num}, RX={rx_pin_num} @ {baud} baud")
+# Slave-response frame IDs (81A 955 555 A)
+ID_LIGHT = 0x23     # Forward light sensor + rolling counter
+ID_ENV   = 0x29     # Temperature, humidity, solar
+ID_RAIN  = 0x30     # FIR rain detection (needs master cmd to activate)
 
-    def calculate_pid(self, frame_id):
-        id0 = (frame_id >> 0) & 1
-        id1 = (frame_id >> 1) & 1
-        id2 = (frame_id >> 2) & 1
-        id3 = (frame_id >> 3) & 1
-        id4 = (frame_id >> 4) & 1
-        id5 = (frame_id >> 5) & 1
-        p0 = id0 ^ id1 ^ id2 ^ id4
-        p1 = ~(id1 ^ id3 ^ id4 ^ id5) & 1
-        return (frame_id & 0x3F) | (p0 << 6) | (p1 << 7)
+# Master command frame ID
+ID_CMD = 0x20
 
-    def calculate_classic_checksum(self, data):
-        chk = 0
-        for b in data:
-            chk += b
-            if chk > 255:
-                chk -= 255
-        return (~chk) & 0xFF
 
-    def send_header(self, frame_id):
-        pid = self.calculate_pid(frame_id)
-        while self.uart.any(): self.uart.read() # Clear buffer
-        self.sm.put(pid ^ 0xFF) # Trigger PIO
-        return pid
+def _build_cmd(wiper=1, sensitivity=2, kl15=True):
+    """Build 8-byte master command payload."""
+    b0 = 0x80 if kl15 else 0x00     # bit7 = ignition ON
+    if wiper:
+        b0 |= 0x01                  # bit0 = wiper active
+    modes = {0: 0x00, 1: 0x04, 2: 0x08, 3: 0x0C}
+    b1 = modes.get(wiper, 0x04)
+    b2 = min(max(sensitivity, 0), 7)
+    return [b0, b1, b2, 0x00, 0x00, 0x00, 0x00, 0x00]
 
-    def read_response(self, length, timeout_ms=50):
-        start = time.ticks_ms()
-        data = b''
-        while (time.ticks_diff(time.ticks_ms(), start) < timeout_ms):
-            if self.uart.any():
-                data += self.uart.read()
-                if len(data) >= length: 
-                    break
-        return data
 
-# ==========================================
-# 2. MIDDLE LAYER: DECODER / PARSER
-# ==========================================
-# This layer decouples the specific sensor bytes from the application logic.
-# If the sensor version changes, only this class needs to be updated.
+# ================================================================
+# Sensor Decoder
+# ================================================================
 
-class VAG_RLS_Parser:
-    """
-    Parser for VAG Rain-Light Sensor (Model 1K0 955 559 AH).
-    Decodes the raw 4-byte LIN payload into meaningful properties.
-    """
+class Sensor:
+    """Decoded readings from all three slave-response frames."""
+
     def __init__(self):
-        self.rain_intensity = 0
-        self.light_forward = 0  # Tunnel detection
-        self.light_ambient = 0  # Day/Night detection
-        self.status = 0
-        
-    def parse(self, data_bytes):
-        """
-        Parses 4 bytes of data.
-        Hypothesis:
-        Byte 0: Rain (0-255)
-        Byte 1: Forward Light (0-255)
-        Byte 2: Ambient Light (0-255)
-        Byte 3: Status check
-        """
-        if len(data_bytes) < 4:
-            return False
-            
-        # ISOLATION: Bytes are treated independently to avoid the previous
-        # bug where Byte 1 and 2 were merged into a 16-bit int.
-        self.rain_intensity = data_bytes[0]
-        self.light_forward  = data_bytes[1]
-        self.light_ambient  = data_bytes[2]
-        self.status         = data_bytes[3]
-        return True
+        # Frame 0x23 — Forward light sensor
+        self.counter = 0          # 4-bit rolling (byte[0] low nibble)
+        self.light = 0            # 16-bit forward ambient (byte[4:5] LE)
 
-    def get_debug_string(self):
-        """Formatted string for testing procedure."""
-        return (f"B0[Rain]: {self.rain_intensity:3d} (0x{self.rain_intensity:02X}) | "
-                f"B1[Fwd]: {self.light_forward:3d} (0x{self.light_forward:02X}) | "
-                f"B2[Amb]: {self.light_ambient:3d} (0x{self.light_ambient:02X}) | "
-                f"B3[St]: 0x{self.status:02X}")
+        # Frame 0x29 — Environmental
+        self.solar = 0            # byte[0] raw — solar/ambient intensity
+        self.temp_raw = 0         # byte[2] raw — temperature
+        self.temp2_raw = 0        # byte[5] raw — secondary temp / dew point
 
-# ==========================================
-# 3. UPPER LAYER: DRL CONTROLLER FRAMEWORK
-# ==========================================
-# This logic is pure software and relies on the normalized data from the Parser.
+        # Frame 0x30 — Rain / FIR
+        self.rain0 = 0            # byte[0] — rain intensity
+        self.rain1 = 0            # byte[1] — rain status/flags
+        self.fir = False          # True when FIR LEDs active
 
-class DRLController:
-    """
-    Manages the logic for Daytime Running Lights vs Low Beams.
-    Includes Hysteresis and Timers.
-    """
-    STATE_DAY_DRL = "DAY_DRL"
-    STATE_NIGHT_BEAM = "NIGHT_BEAM"
-    
-    def __init__(self):
-        self.state = self.STATE_DAY_DRL
-        self.last_switch_time = time.ticks_ms()
-        
-        # -- PARAMETERS (Tune these during testing) --
-        # Ambient Light (Byte 2)
-        self.THRES_NIGHT_ENTER = 20  # If Ambient < 20 -> Go Night
-        self.THRES_NIGHT_LEAVE = 40  # If Ambient > 40 -> Go Day (Hysteresis)
-        
-        # Tunnel / Forward Light (Byte 1)
-        self.THRES_TUNNEL_ENTER = 10 # If Forward < 10 -> Go Night
-        
-        # Timers (ms)
-        self.DELAY_TO_NIGHT = 2000   # Delay before switching ON lights (avoid bridge shadows)
-        self.DELAY_TO_DAY   = 5000   # Delay before switching OFF lights (safety)
-        self.DELAY_TUNNEL   = 0      # Instant reaction for tunnel
-        
-        self.pending_state = None
-        self.pending_start_time = 0
+        self._ok = [False] * 3   # [light, env, rain] received at least once
 
-    def update(self, parser: VAG_RLS_Parser):
-        """Run the state machine based on latest sensor data."""
-        
-        desired_state = self.state
-        reaction_time = 0
-        reason = ""
+    def feed(self, fid, data):
+        """Decode frame data by ID."""
+        if not data:
+            return
+        if fid == ID_LIGHT and len(data) >= 6:
+            self.counter = data[0] & 0x0F
+            self.light = data[4] | (data[5] << 8)
+            self._ok[0] = True
+        elif fid == ID_ENV and len(data) >= 6:
+            self.solar = data[0]
+            self.temp_raw = data[2]
+            self.temp2_raw = data[5]
+            self._ok[1] = True
+        elif fid == ID_RAIN and len(data) >= 2:
+            self.rain0 = data[0]
+            self.rain1 = data[1]
+            self.fir = data[0] != 0 or data[1] != 0
+            self._ok[2] = True
 
-        # Logic 1: Ambient Light (Day/Night)
-        if self.state == self.STATE_DAY_DRL:
-            if parser.light_ambient < self.THRES_NIGHT_ENTER:
-                desired_state = self.STATE_NIGHT_BEAM
-                reaction_time = self.DELAY_TO_NIGHT
-                reason = "Ambient Low (Dusk)"
-                
-            # Logic 2: Tunnel Override (Fast reaction)
-            # Tunnel is detected when Forward light drops drastically
-            if parser.light_forward < self.THRES_TUNNEL_ENTER:
-                desired_state = self.STATE_NIGHT_BEAM
-                reaction_time = self.DELAY_TUNNEL
-                reason = "Forward Low (Tunnel)"
-                
-        elif self.state == self.STATE_NIGHT_BEAM:
-            # Return to Day only if Ambient is bright enough
-            if parser.light_ambient > self.THRES_NIGHT_LEAVE:
-                desired_state = self.STATE_DAY_DRL
-                reaction_time = self.DELAY_TO_DAY
-                reason = "Ambient High (Dawn)"
-                
-            # Tunnel exit logic is implicitly handled by Ambient check 
-            # (usually tunnels are dark globally), but sometimes Forward raises first.
-            # Ideally we check if Forward is High AND Ambient is High.
+    @property
+    def temp(self):
+        """Temperature in C (raw * 0.5 - 40)."""
+        return self.temp_raw * 0.5 - 40.0
 
-        # Hysteresis / Timer Logic
-        current_time = time.ticks_ms()
-        
-        if desired_state != self.state:
-            if self.pending_state != desired_state:
-                # Start timer
-                self.pending_state = desired_state
-                self.pending_start_time = current_time
+    @property
+    def temp2(self):
+        """Dew point temperature in C (raw * 0.5 - 40)."""
+        return self.temp2_raw * 0.5 - 40.0
+
+    @property
+    def light_pct(self):
+        """Light as percentage: 0xEC00=0% (dark) .. 0xEFFF=100% (bright)."""
+        lo, hi = 0xEC00, 0xEFFF
+        if self.light <= lo:
+            return 0
+        if self.light >= hi:
+            return 100
+        return (self.light - lo) * 100 // (hi - lo)
+
+    def line(self):
+        """One-line status summary."""
+        parts = []
+        if self._ok[0]:
+            pct = self.light_pct
+            n = pct // 10
+            bar = '#' * n + '-' * (10 - n)
+            parts.append("Light %3d%% [%s] 0x%04X" % (pct, bar, self.light))
+        if self._ok[1]:
+            parts.append("%.1fC  Dew %.1fC" % (self.temp, self.temp2))
+        if self._ok[2]:
+            if self.fir:
+                parts.append("Rain: ACTIVE(%02X,%02X)" % (self.rain0, self.rain1))
             else:
-                # Timer running
-                elapsed = time.ticks_diff(current_time, self.pending_start_time)
-                if elapsed > reaction_time:
-                    self.state = desired_state
-                    self.pending_state = None
-                    print(f"!!! STATE CHANGE: {self.state} ({reason}) !!!")
+                parts.append("Rain: dry")
+        return " | ".join(parts) if parts else "no data"
+
+
+# ================================================================
+# DRL Controller
+# ================================================================
+
+class DRL:
+    """Day/night state machine for headlight control."""
+
+    def __init__(self, dark=0xEA00, bright=0xEC00):
+        self.state = "DAY"
+        self.dark = dark
+        self.bright = bright
+        self._pend = None
+        self._t0 = 0
+
+    def update(self, light):
+        want, delay = self.state, 0
+        if self.state == "DAY" and light < self.dark:
+            want, delay = "NIGHT", 3000
+        elif self.state == "NIGHT" and light > self.bright:
+            want, delay = "DAY", 5000
+        now = time.ticks_ms()
+        if want != self.state:
+            if self._pend != want:
+                self._pend, self._t0 = want, now
+            elif time.ticks_diff(now, self._t0) >= delay:
+                old = self.state
+                self.state, self._pend = want, None
+                print(">>> DRL: %s -> %s <<<" % (old, self.state))
         else:
-            # Reset timer if condition cleared
-            self.pending_state = None
-            
+            self._pend = None
         return self.state
 
-# ==========================================
-# 4. MAIN EXECUTION LOOP
-# ==========================================
 
-def run():
-    lin = LINMaster(tx_pin_num=0, rx_pin_num=1)
-    parser = VAG_RLS_Parser()
-    controller = DRLController()
-    
-    SENSOR_ID = 0x22
-    PID_ECHO = 0xE2
-    
-    print("\n" + "="*60)
-    print(" VAG RLS TESTING FRAMEWORK STARTED")
-    print("="*60)
-    print(" 1. Cover entire sensor -> Check B2 (Ambient) drops to 0")
-    print(" 2. Shine light into front eye -> Check B1 (Fwd) spikes")
-    print(" 3. Spray sensor (on glass) -> Check B0 (Rain) increases")
-    print("="*60)
-    
-    while True:
-        try:
-            # 1. Send Header
-            pid = lin.send_header(SENSOR_ID)
-            
-            # 2. Read Response (PID + 4 Data + Checksum = 6 bytes)
-            # We ask for a bit more (7) to be safe with timing/noise
-            raw = lin.read_response(length=7, timeout_ms=60)
-            
-            if raw:
-                # Find the echo PID (0xE2)
-                pid_byte = bytes([pid])
-                if pid_byte in raw:
-                    idx = raw.index(pid_byte)
-                    frame = raw[idx+1:]
-                    
-                    if len(frame) >= 5: # 4 Data + 1 Checksum
-                        data_bytes = frame[0:4]
-                        chk_recv = frame[4]
-                        
-                        # Validate Checksum (Classic)
-                        chk_calc = lin.calculate_classic_checksum(data_bytes)
-                        
-                        if chk_recv == chk_calc:
-                            # Valid Frame -> Parse it
-                            parser.parse(data_bytes)
-                            
-                            # Run Logic
-                            current_state = controller.update(parser)
-                            
-                            # Log output (Raw + Logic decision)
-                            # Using \r to overwrite line for cleaner dashboard look in terminal
-                            # remove end='\r' if using simple scrolling log
-                            print(f"[{current_state}] {parser.get_debug_string()}")
-                            
-                        else:
-                            # print(f"Checksum Error: Recv {hex(chk_recv)} != Exp {hex(chk_calc)}")
-                            pass
-            
-            time.sleep(0.1) # loop delay
-            
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            break
+# ================================================================
+# BCM Emulator — Main Scheduler
+# ================================================================
+
+def run(cmd_id=None, wiper=1, sensitivity=2, verbose=False):
+    """
+    BCM emulator: LIN master schedule loop.
+
+    Every cycle (~60ms):
+      1. TX master command -> sensor
+      2. RX 0x23 (forward light)
+      3. RX 0x30 (rain / FIR)
+      4. RX 0x29 (environment, every 5th cycle)
+      5. Update DRL state
+    """
+    if cmd_id is None:
+        cmd_id = ID_CMD
+
+    lin = LIN()
+    sensor = Sensor()
+    drl = DRL()
+    cmd_data = _build_cmd(wiper=wiper, sensitivity=sensitivity)
+
+    print("\n" + "=" * 64)
+    print(" VAG RLS 81A 955 555 A \u2014 BCM Emulator")
+    print(" Light: 0xEC00 (dark) .. 0xEFFF (bright)")
+    print(" Temp: raw*0.5-40  Dew: dew point  Rain: FIR active/dry")
+    print("=" * 64)
+    print("CMD: 0x%02X [%s]  Wiper=%d Sens=%d" % (
+        cmd_id, " ".join("%02X" % b for b in cmd_data), wiper, sensitivity))
+    print("Ctrl+C to stop\n")
+
+    cycle = 0
+    try:
+        while True:
+            lin.send(cmd_id, cmd_data)
+            time.sleep_ms(5)
+
+            for fid in (ID_LIGHT, ID_RAIN):
+                data, ok = lin.recv(fid)
+                if data and ok:
+                    sensor.feed(fid, data)
+                time.sleep_ms(2)
+
+            if cycle % 5 == 0:
+                data, ok = lin.recv(ID_ENV)
+                if data and ok:
+                    sensor.feed(ID_ENV, data)
+
+            st = drl.update(sensor.light) if sensor._ok[0] else "???"
+
+            if verbose:
+                print("[%04d][%-5s] %s" % (cycle, st, sensor.line()))
+            else:
+                print("[%-5s] %s" % (st, sensor.line()))
+
+            cycle += 1
+            time.sleep_ms(50)
+    except KeyboardInterrupt:
+        print("\nStopped after %d cycles." % cycle)
+
 
 if __name__ == "__main__":
     run()

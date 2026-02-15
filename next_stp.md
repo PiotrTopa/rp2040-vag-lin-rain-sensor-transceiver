@@ -1,0 +1,1 @@
+Wprowadzic BCM zarzadzanie scheduler do wystawiania sygnalu zaplonu i czytanie danych po LIDS 
